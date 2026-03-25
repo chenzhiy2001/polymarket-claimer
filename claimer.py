@@ -33,9 +33,10 @@ log = logging.getLogger("claimer")
 
 # ── constants ───────────────────────────────────────────────────────
 CHAIN_ID = 137  # Polygon mainnet
-CLAIM_DELAY = 5  # seconds between redemptions
-MAX_RETRIES = 5  # per-position retry count
-INITIAL_BACKOFF = 10  # seconds (doubles each attempt)
+CLAIM_DELAY = 1  # seconds between redemptions
+MAX_RETRIES = 3  # per-position retry count
+INITIAL_BACKOFF = 3  # seconds (doubles each attempt)
+MAX_WORKERS = 4  # concurrent claim threads
 
 
 # ── Relayer API key client ──────────────────────────────────────────
@@ -72,17 +73,18 @@ class RelayerWeb3Client(PolymarketGaslessWeb3Client):
         response.raise_for_status()
 
         gasless_response = response.json()
-        log.info("Gasless txn submitted: %s", gasless_response.get("transactionHash", "N/A"))
-        log.info("Transaction ID: %s", gasless_response.get("transactionID", "N/A"))
-        log.info("State: %s", gasless_response.get("state", "N/A"))
+        print(f"Gasless txn submitted: {gasless_response.get('transactionHash', 'N/A')}")
+        print(f"Transaction ID: {gasless_response.get('transactionID', 'N/A')}")
+        print(f"State: {gasless_response.get('state', 'N/A')}")
 
         tx_hash = gasless_response.get("transactionHash")
         if tx_hash:
             receipt_dict = self.w3.eth.wait_for_transaction_receipt(tx_hash)
             receipt = TransactionReceipt.model_validate(receipt_dict)
-            log.info(
-                "%s succeeded" if receipt.status == 1 else "%s failed",
-                operation_name,
+            print(
+                f"{operation_name} succeeded"
+                if receipt.status == 1
+                else f"{operation_name} failed"
             )
             return receipt
         msg = f"No transaction hash in response: {gasless_response}"
@@ -202,10 +204,9 @@ def claim_all(
             p.title, p.outcome, p.size, p.negative_risk,
         )
 
-    claimed = 0
-    failed = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for i, p in enumerate(positions):
+    def _claim_one(i, p):
         log.info(
             "[%d/%d] Redeeming %s — %s (%.4f shares)…",
             i + 1, len(positions), p.title, p.outcome, p.size,
@@ -220,15 +221,24 @@ def claim_all(
             )
             tx_hash = getattr(receipt, "tx_hash", None) or "?"
             log.info("  ✓ Claimed  tx=%s", tx_hash)
-            claimed += 1
-
+            return True
         except Exception:
             log.exception("  ✗ Failed to redeem %s (%s)", p.title, p.outcome)
-            failed += 1
+            return False
 
-        # throttle between claims
-        if i < len(positions) - 1:
-            time.sleep(CLAIM_DELAY)
+    claimed = 0
+    failed = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_claim_one, i, p): p
+            for i, p in enumerate(positions)
+        }
+        for fut in as_completed(futures):
+            if fut.result():
+                claimed += 1
+            else:
+                failed += 1
 
     log.info(
         "Batch done: %d claimed, %d failed, %d remaining.",
